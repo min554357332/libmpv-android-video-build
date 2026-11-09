@@ -45,7 +45,6 @@ cpuflags=
 	--disable-parsers \
 	--disable-protocols \
 	--disable-devices \
-	--disable-filters \
 	--disable-doc \
 	--disable-avdevice \
 	--disable-postproc \
