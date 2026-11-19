@@ -54,6 +54,9 @@ loadarch () {
 	fi
 	export CXX=$cc_triple-clang++
 	export LDFLAGS="-Wl,-O1,--icf=safe -Wl,-z,max-page-size=16384 -Wl,--build-id=sha1"
+	export CFLAGS="-gdwarf-4"
+	export CXXFLAGS="-gdwarf-4"
+	export CPPFLAGS="-gdwarf-4"
 	export AR=llvm-ar
 	export RANLIB=llvm-ranlib
 }
@@ -79,6 +82,8 @@ setup_prefix () {
 [built-in options]
 buildtype = 'release'
 default_library = 'static'
+c_args = ['-gdwarf-4']
+cpp_args = ['-gdwarf-4']
 wrap_mode = 'nodownload'
 [binaries]
 c = '$CC'
