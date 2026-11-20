@@ -1,0 +1,124 @@
+diff --git a/player/client.c b/player/client.c
+index f16af45..b656aa7 100644
+--- a/player/client.c
++++ b/player/client.c
+@@ -13,6 +13,10 @@
+  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+  */
+ 
++#ifdef __linux__
++#include <sys/mman.h>
++#endif
++#include <stdio.h>
+ #include <stddef.h>
+ #include <stdint.h>
+ #include <stdlib.h>
+@@ -128,6 +132,9 @@ struct mpv_handle {
+     void (*wakeup_cb)(void *d);
+     void *wakeup_cb_ctx;
+     int wakeup_pipe[2];
++    // Defensive liveness probe state for wakeup_cb; see wakeup_cb_is_callable().
++    void *wakeup_cb_probed;
++    double wakeup_cb_probe_time;
+ 
+     // -- protected by lock
+ 
+@@ -342,13 +349,79 @@ struct mpv_global *mp_client_get_global(struct mpv_handle *ctx)
+     return ctx->mpctx->global;
+ }
+ 
++// The client API lets the embedding application install a callback which is
++// invoked whenever there is new API activity, possibly from arbitrary internal
++// threads (core thread, demuxer thread, stream/network worker thread, ...).
++// libmpv has no way to know whether such a callback is still alive. If the
++// client frees the code behind it - which happens with runtime generated
++// callbacks, e.g. Dart's NativeCallable trampolines, or any client library
++// whose VM/isolate was torn down - then the call below is an indirect jump
++// into unmapped memory, i.e. a SIGSEGV which kills the whole process even
++// though only one client went away.
++//
++// A foreign function pointer cannot be validated in general, but we can refuse
++// to jump into memory that is not mapped at all, which is exactly the case
++// above. mincore() is the cheapest way to ask that question on Linux/Android.
++// The probe is rate limited (once per second per handle, and only if the
++// pointer changed), so the common path costs a comparison and a clock read.
++//
++// On failure the callback is dropped permanently; the client may re-register
++// it with mpv_set_wakeup_callback(). A client that stops being woken up is
++// incomparably better than a dying process, and mpv_get_wakeup_pipe() keeps
++// working, so clients that poll the pipe are unaffected.
++static bool wakeup_cb_is_callable(struct mpv_handle *ctx)
++{
++    if (!ctx->wakeup_cb)
++        return false;
++
++#ifdef __linux__
++    if (ctx->wakeup_cb == ctx->wakeup_cb_probed &&
++        mp_time_sec() - ctx->wakeup_cb_probe_time < 1.0)
++        return true;
++
++    static long pagesize_hint;
++    long pagesize = pagesize_hint;
++    if (pagesize <= 0) {
++        pagesize = sysconf(_SC_PAGESIZE);
++        if (pagesize <= 0)
++            pagesize = 4096;
++        pagesize_hint = pagesize;
++    }
++
++    uintptr_t addr = (uintptr_t)ctx->wakeup_cb & ~(uintptr_t)(pagesize - 1);
++    unsigned char vec = 0;
++    // ENOMEM: the range contains unmapped pages.
++    if (mincore((void *)addr, (size_t)pagesize, &vec) != 0) {
++        // Must not log via mp_msg()/MP_ERR() here: this can run on the logging
++        // path while the global log lock is held.
++        fprintf(stderr, "[libmpv] client wakeup callback %p (handle %p) is not "
++                        "mapped, dropping it instead of calling it; this client "
++                        "will not be woken up by libmpv anymore.\n",
++                (void *)ctx->wakeup_cb, (void *)ctx);
++        ctx->wakeup_cb = NULL;
++        ctx->wakeup_cb_ctx = NULL;
++        ctx->wakeup_cb_probed = NULL;
++        ctx->wakeup_cb_probe_time = 0;
++        return false;
++    }
++
++    ctx->wakeup_cb_probed = ctx->wakeup_cb;
++    ctx->wakeup_cb_probe_time = mp_time_sec();
++    return true;
++#else
++    // No portable way to ask the kernel on this platform; trust the client.
++    return true;
++#endif
++}
++
+ static void wakeup_client(struct mpv_handle *ctx)
+ {
+     pthread_mutex_lock(&ctx->wakeup_lock);
+     if (!ctx->need_wakeup) {
+         ctx->need_wakeup = true;
+         pthread_cond_broadcast(&ctx->wakeup);
+-        if (ctx->wakeup_cb)
++        // This invokes foreign code; see wakeup_cb_is_callable().
++        if (wakeup_cb_is_callable(ctx))
+             ctx->wakeup_cb(ctx->wakeup_cb_ctx);
+         if (ctx->wakeup_pipe[0] != -1)
+             (void)write(ctx->wakeup_pipe[1], &(char){0}, 1);
+@@ -376,9 +449,16 @@ static int wait_wakeup(struct mpv_handle *ctx, int64_t end)
+ void mpv_set_wakeup_callback(mpv_handle *ctx, void (*cb)(void *d), void *d)
+ {
+     pthread_mutex_lock(&ctx->wakeup_lock);
++    if (ctx->wakeup_cb != cb) {
++        // New callback: forget what we know about the old one. This is what
++        // lets a client recover after wakeup_cb_is_callable() dropped its
++        // callback as unmapped.
++        ctx->wakeup_cb_probed = NULL;
++        ctx->wakeup_cb_probe_time = 0;
++    }
+     ctx->wakeup_cb = cb;
+     ctx->wakeup_cb_ctx = d;
+-    if (ctx->wakeup_cb)
++    if (wakeup_cb_is_callable(ctx))
+         ctx->wakeup_cb(ctx->wakeup_cb_ctx);
+     pthread_mutex_unlock(&ctx->wakeup_lock);
+ }
